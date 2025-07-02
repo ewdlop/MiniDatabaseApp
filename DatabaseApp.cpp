@@ -61,9 +61,12 @@ public:
     }
 
     ~DiskManager() {
+        std::cout << "DEBUG: DiskManager destructor - closing files\n";
         for (auto& [filename, stream] : file_streams_) {
             if (stream.is_open()) {
+                stream.flush();  // 確保所有資料都寫入
                 stream.close();
+                std::cout << "DEBUG: Closed file: " << filename << std::endl;
             }
         }
     }
@@ -80,20 +83,25 @@ public:
                 std::filesystem::create_directories(dir_path);
             }
             
-            // 首先嘗試打開現有檔案
+            // 直接創建文件，確保可讀寫
             file_streams_[filename] = std::fstream(filepath,
-                std::ios::in | std::ios::out | std::ios::binary);
-
-            if (!file_streams_[filename].is_open()) {
-                // 如果檔案不存在，創建它
-                file_streams_[filename] = std::fstream(filepath,
-                    std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
+                std::ios::in | std::ios::out | std::ios::binary | std::ios::trunc);
                 
-                // 如果仍然無法打開，報告錯誤
-                if (!file_streams_[filename].is_open()) {
-                    std::cerr << "Failed to create file: " << filepath << std::endl;
+            if (!file_streams_[filename].is_open()) {
+                std::cerr << "Failed to create file: " << filepath << std::endl;
+            } else {
+                std::cout << "DEBUG: Successfully created file: " << filepath << std::endl;
+                
+                // 確保文件可寫入 - 寫入一些初始資料然後 seek 回開頭
+                file_streams_[filename].write("\0", 1);
+                file_streams_[filename].flush();
+                file_streams_[filename].seekp(0);
+                file_streams_[filename].seekg(0);
+                
+                if (file_streams_[filename].good()) {
+                    std::cout << "DEBUG: File stream is ready for I/O: " << filepath << std::endl;
                 } else {
-                    std::cout << "DEBUG: Successfully created file: " << filepath << std::endl;
+                    std::cerr << "ERROR: File stream not ready for I/O: " << filepath << std::endl;
                 }
             }
         }
@@ -106,7 +114,26 @@ public:
             stream.seekp(page_id * PAGE_SIZE);
             stream.write(page.data.data(), PAGE_SIZE);
             stream.flush();
-            std::cout << "DEBUG: Wrote page " << page_id << " to file " << filename << std::endl;
+            
+            // 檢查寫入是否成功
+            if (stream.good()) {
+                std::cout << "DEBUG: Successfully wrote page " << page_id << " to file " << filename 
+                          << " (size: " << PAGE_SIZE << " bytes)" << std::endl;
+            } else {
+                std::cerr << "ERROR: Failed to write page " << page_id << " to file " << filename 
+                          << " - Stream state: " << stream.rdstate() << std::endl;
+                // 嘗試重置流狀態
+                stream.clear();
+                stream.seekp(page_id * PAGE_SIZE);
+                stream.write(page.data.data(), PAGE_SIZE);
+                stream.flush();
+                
+                if (stream.good()) {
+                    std::cout << "DEBUG: Retry write succeeded for page " << page_id << std::endl;
+                } else {
+                    std::cerr << "ERROR: Retry write also failed for page " << page_id << std::endl;
+                }
+            }
         } else {
             std::cerr << "ERROR: Cannot write to file " << filename << std::endl;
         }
@@ -116,15 +143,31 @@ public:
         auto& stream = getFileStream(filename);
         if (stream.is_open()) {
             stream.seekg(page_id * PAGE_SIZE);
-            if (stream.gcount() > 0 || stream.good()) {
+            
+            if (stream.good()) {
                 stream.read(page.data.data(), PAGE_SIZE);
-                if (stream.gcount() < PAGE_SIZE) {
+                
+                // 檢查實際讀取的字節數
+                std::streamsize bytes_read = stream.gcount();
+                if (bytes_read < PAGE_SIZE) {
                     // 如果檔案較小，將剩餘字節初始化為零
-                    std::fill(page.data.begin() + stream.gcount(), page.data.end(), 0);
+                    std::fill(page.data.begin() + bytes_read, page.data.end(), 0);
+                    std::cout << "DEBUG: Read " << bytes_read << " bytes from page " << page_id 
+                              << " in file " << filename << " (padded with zeros)" << std::endl;
+                } else {
+                    std::cout << "DEBUG: Successfully read full page " << page_id 
+                              << " from file " << filename << std::endl;
+                }
+                
+                // 清除 EOF 錯誤狀態（如果有的話）
+                if (stream.eof()) {
+                    stream.clear();
                 }
             } else {
-                // 如果讀取失敗，將頁面初始化為零
+                // 如果 seek 失敗，將頁面初始化為零
                 std::fill(page.data.begin(), page.data.end(), 0);
+                std::cout << "DEBUG: Initialized empty page " << page_id 
+                          << " for file " << filename << std::endl;
             }
         } else {
             std::cerr << "ERROR: Cannot read from file " << filename << std::endl;
@@ -161,8 +204,12 @@ public:
 
         // 頁面不在緩衝池中，需要從磁碟載入
         auto page = std::make_shared<Page>(page_id);
-        // 只有當這不是新頁面時才嘗試讀取
+        
+        // 嘗試從磁碟讀取頁面
         disk_manager_.readPage(filename, page_id, *page);
+        
+        // 新頁面開始時不標記為髒頁，只有真正修改時才標記
+        page->is_dirty = false;
 
         // 檢查是否需要淘汰頁面
         if (getTotalPages() >= pool_size_) {
@@ -320,6 +367,93 @@ public:
     }
 
 private:
+    // 序列化值到緩衝區
+    void serializeValue(char* data, size_t& offset, const Value& value, DataType type) {
+        switch (type) {
+        case DataType::INT32: {
+            int32_t val = std::get<int32_t>(value);
+            std::memcpy(data + offset, &val, sizeof(int32_t));
+            offset += sizeof(int32_t);
+            break;
+        }
+        case DataType::INT64: {
+            int64_t val = std::get<int64_t>(value);
+            std::memcpy(data + offset, &val, sizeof(int64_t));
+            offset += sizeof(int64_t);
+            break;
+        }
+        case DataType::FLOAT: {
+            float val = std::get<float>(value);
+            std::memcpy(data + offset, &val, sizeof(float));
+            offset += sizeof(float);
+            break;
+        }
+        case DataType::DOUBLE: {
+            double val = std::get<double>(value);
+            std::memcpy(data + offset, &val, sizeof(double));
+            offset += sizeof(double);
+            break;
+        }
+        case DataType::STRING: {
+            std::string val = std::get<std::string>(value);
+            // 限制字串長度並填充到固定大小
+            val.resize(255, '\0');
+            std::memcpy(data + offset, val.c_str(), 256);
+            offset += 256;
+            break;
+        }
+        case DataType::BOOL: {
+            bool val = std::get<bool>(value);
+            std::memcpy(data + offset, &val, sizeof(bool));
+            offset += sizeof(bool);
+            break;
+        }
+        }
+    }
+    
+    // 從緩衝區反序列化值
+    Value deserializeValue(const char* data, size_t& offset, DataType type) {
+        switch (type) {
+        case DataType::INT32: {
+            int32_t val;
+            std::memcpy(&val, data + offset, sizeof(int32_t));
+            offset += sizeof(int32_t);
+            return val;
+        }
+        case DataType::INT64: {
+            int64_t val;
+            std::memcpy(&val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+            return val;
+        }
+        case DataType::FLOAT: {
+            float val;
+            std::memcpy(&val, data + offset, sizeof(float));
+            offset += sizeof(float);
+            return val;
+        }
+        case DataType::DOUBLE: {
+            double val;
+            std::memcpy(&val, data + offset, sizeof(double));
+            offset += sizeof(double);
+            return val;
+        }
+        case DataType::STRING: {
+            std::string val(data + offset, 256);
+            val = val.c_str(); // 移除尾部的 null 字符
+            offset += 256;
+            return val;
+        }
+        case DataType::BOOL: {
+            bool val;
+            std::memcpy(&val, data + offset, sizeof(bool));
+            offset += sizeof(bool);
+            return val;
+        }
+        }
+        return int32_t(0); // 預設值
+    }
+
     PageId createNewNode(bool is_leaf) {
         static PageId next_page_id = 1;
         PageId page_id = next_page_id++;
@@ -332,21 +466,174 @@ private:
 
     std::shared_ptr<BPlusTreeNode> getNode(PageId page_id) {
         auto page = buffer_manager_.fetchPage(index_name_, page_id);
-
-        // 簡化：直接將頁面資料解釋為節點
-        // 實際實作中需要序列化/反序列化
         auto node = std::make_shared<BPlusTreeNode>();
-        // 在這裡進行反序列化...
-
+        
+        char* data = page->data.data();
+        size_t offset = 0;
+        
+        // 檢查是否為空頁面（全零）
+        bool is_empty = true;
+        for (size_t i = 0; i < PAGE_SIZE && is_empty; ++i) {
+            if (data[i] != 0) is_empty = false;
+        }
+        
+        if (is_empty) {
+            std::cout << "DEBUG: Loading empty B+ tree node " << page_id << " (initializing new node)" << std::endl;
+            return node;
+        }
+        
+        std::cout << "DEBUG: Deserializing B+ tree node " << page_id << " from disk" << std::endl;
+        
+        // 讀取節點類型
+        std::memcpy(&node->is_leaf, data + offset, sizeof(bool));
+        offset += sizeof(bool);
+        
+        // 讀取資料型別
+        DataType node_data_type;
+        std::memcpy(&node_data_type, data + offset, sizeof(DataType));
+        offset += sizeof(DataType);
+        
+        // 讀取鍵的數量
+        size_t key_count;
+        std::memcpy(&key_count, data + offset, sizeof(size_t));
+        offset += sizeof(size_t);
+        
+        // 驗證鍵數量是否合理
+        if (key_count > max_keys_) {
+            std::cerr << "ERROR: Invalid key count " << key_count << " in B+ tree node " << page_id << std::endl;
+            return node; // 返回空節點
+        }
+        
+        // 讀取鍵值
+        node->keys.reserve(key_count);
+        for (size_t i = 0; i < key_count; ++i) {
+            try {
+                Value key = deserializeValue(data, offset, node_data_type);
+                node->keys.push_back(key);
+            } catch (const std::exception& e) {
+                std::cerr << "ERROR: Failed to deserialize key " << i << " in node " << page_id 
+                          << ": " << e.what() << std::endl;
+                return node; // 返回部分反序列化的節點
+            }
+        }
+        
+        // 讀取記錄或子節點
+        if (node->is_leaf) {
+            node->records.resize(key_count);
+            for (size_t i = 0; i < key_count; ++i) {
+                std::memcpy(&node->records[i], data + offset, sizeof(RecordId));
+                offset += sizeof(RecordId);
+            }
+            
+            // 讀取下一個葉節點指標
+            std::memcpy(&node->next_leaf, data + offset, sizeof(PageId));
+            offset += sizeof(PageId);
+            
+            // 數據一致性檢查：葉子節點的keys和records數量應該相等
+            if (node->keys.size() != node->records.size()) {
+                std::cerr << "ERROR: Leaf node " << page_id << " data inconsistency - keys: " 
+                          << node->keys.size() << ", records: " << node->records.size() << std::endl;
+                // 修正數據不一致問題
+                size_t min_size = std::min(node->keys.size(), node->records.size());
+                node->keys.resize(min_size);
+                node->records.resize(min_size);
+            }
+        } else {
+            size_t child_count = key_count + 1;
+            node->children.resize(child_count);
+            for (size_t i = 0; i < child_count; ++i) {
+                std::memcpy(&node->children[i], data + offset, sizeof(PageId));
+                offset += sizeof(PageId);
+            }
+            
+            // 數據一致性檢查：內部節點的children數量應該是keys數量+1
+            if (node->children.size() != node->keys.size() + 1) {
+                std::cerr << "ERROR: Internal node " << page_id << " data inconsistency - keys: " 
+                          << node->keys.size() << ", children: " << node->children.size() << std::endl;
+                // 修正數據不一致問題
+                if (node->children.size() < node->keys.size() + 1) {
+                    // 如果children太少，添加虛擬子節點
+                    node->children.resize(node->keys.size() + 1, 0);
+                } else {
+                    // 如果children太多，截斷到正確大小
+                    node->children.resize(node->keys.size() + 1);
+                }
+            }
+        }
+        
         return node;
     }
 
     void saveNode(PageId page_id, const BPlusTreeNode& node) {
+        // 在序列化前進行數據一致性檢查
+        if (node.is_leaf) {
+            if (node.keys.size() != node.records.size()) {
+                std::cerr << "ERROR: Cannot serialize leaf node " << page_id 
+                          << " - keys size: " << node.keys.size() 
+                          << ", records size: " << node.records.size() << std::endl;
+                return;
+            }
+        } else {
+            if (node.children.size() != node.keys.size() + 1) {
+                std::cerr << "ERROR: Cannot serialize internal node " << page_id 
+                          << " - keys size: " << node.keys.size() 
+                          << ", children size: " << node.children.size() << std::endl;
+                return;
+            }
+        }
+        
         auto page = buffer_manager_.fetchPage(index_name_, page_id);
-
-        // 簡化：直接將節點資料寫入頁面
-        // 實際實作中需要序列化
+        
+        std::cout << "DEBUG: Serializing B+ tree node " << page_id << " to disk" << std::endl;
+        
+        char* data = page->data.data();
+        size_t offset = 0;
+        
+        // 清空頁面
+        std::fill(page->data.begin(), page->data.end(), 0);
+        
+        // 寫入節點類型
+        std::memcpy(data + offset, &node.is_leaf, sizeof(bool));
+        offset += sizeof(bool);
+        
+        // 寫入資料型別
+        std::memcpy(data + offset, &key_type_, sizeof(DataType));
+        offset += sizeof(DataType);
+        
+        // 寫入鍵的數量
+        size_t key_count = node.keys.size();
+        std::memcpy(data + offset, &key_count, sizeof(size_t));
+        offset += sizeof(size_t);
+        
+        // 序列化鍵值
+        for (size_t i = 0; i < key_count; ++i) {
+            serializeValue(data, offset, node.keys[i], key_type_);
+        }
+        
+        // 序列化記錄或子節點
+        if (node.is_leaf) {
+            for (size_t i = 0; i < key_count; ++i) {
+                std::memcpy(data + offset, &node.records[i], sizeof(RecordId));
+                offset += sizeof(RecordId);
+            }
+            
+            // 寫入下一個葉節點指標
+            std::memcpy(data + offset, &node.next_leaf, sizeof(PageId));
+            offset += sizeof(PageId);
+        } else {
+            for (size_t i = 0; i < node.children.size(); ++i) {
+                std::memcpy(data + offset, &node.children[i], sizeof(PageId));
+                offset += sizeof(PageId);
+            }
+        }
+        
         page->is_dirty = true;
+        std::cout << "DEBUG: B+ tree node " << page_id << " serialized, " << offset << " bytes used" << std::endl;
+        
+        // 驗證序列化大小不超過頁面大小
+        if (offset > PAGE_SIZE) {
+            std::cerr << "ERROR: Serialized node too large: " << offset << " bytes (max: " << PAGE_SIZE << ")" << std::endl;
+        }
     }
 
     std::pair<Value, PageId> insertInternal(PageId page_id, const Value& key, RecordId record_id) {
@@ -367,6 +654,13 @@ private:
         else {
             // 內部節點：找到合適的子節點
             size_t child_index = findChildIndex(*node, key);
+            
+            // 額外的邊界檢查
+            if (child_index >= node->children.size()) {
+                std::cerr << "ERROR: Child index " << child_index << " out of range in insertInternal" << std::endl;
+                child_index = node->children.size() > 0 ? node->children.size() - 1 : 0;
+            }
+            
             auto result = insertInternal(node->children[child_index], key, record_id);
 
             if (result.second != 0) {
@@ -392,6 +686,13 @@ private:
         }
         else {
             size_t child_index = findChildIndex(*node, key);
+            
+            // 額外的邊界檢查
+            if (child_index >= node->children.size()) {
+                std::cerr << "ERROR: Child index " << child_index << " out of range in findLeaf" << std::endl;
+                child_index = node->children.size() > 0 ? node->children.size() - 1 : 0;
+            }
+            
             return findLeaf(node->children[child_index], key);
         }
     }
@@ -403,13 +704,45 @@ private:
             });
 
         size_t index = pos - node.keys.begin();
+        
+        // 確保records向量大小正確
+        if (node.records.size() != node.keys.size()) {
+            std::cerr << "ERROR: Leaf node data inconsistency before insert - keys: " 
+                      << node.keys.size() << ", records: " << node.records.size() << std::endl;
+            node.records.resize(node.keys.size());
+        }
+        
         node.keys.insert(pos, key);
         node.records.insert(node.records.begin() + index, record_id);
+        
+        // 驗證插入後的一致性
+        if (node.keys.size() != node.records.size()) {
+            std::cerr << "ERROR: Leaf node data inconsistency after insert!" << std::endl;
+        }
     }
 
     void insertIntoInternal(BPlusTreeNode& node, const Value& key, PageId new_child, size_t child_index) {
+        // 檢查插入位置的有效性
+        if (child_index > node.keys.size()) {
+            std::cerr << "ERROR: Invalid child_index " << child_index 
+                      << " for internal node with " << node.keys.size() << " keys" << std::endl;
+            child_index = node.keys.size();
+        }
+        
+        // 確保children向量大小正確（應該是keys.size() + 1）
+        if (node.children.size() != node.keys.size() + 1) {
+            std::cerr << "ERROR: Internal node data inconsistency before insert - keys: " 
+                      << node.keys.size() << ", children: " << node.children.size() << std::endl;
+            node.children.resize(node.keys.size() + 1, 0);
+        }
+        
         node.keys.insert(node.keys.begin() + child_index, key);
         node.children.insert(node.children.begin() + child_index + 1, new_child);
+        
+        // 驗證插入後的一致性
+        if (node.children.size() != node.keys.size() + 1) {
+            std::cerr << "ERROR: Internal node data inconsistency after insert!" << std::endl;
+        }
     }
 
     std::pair<Value, PageId> splitLeaf(PageId page_id, BPlusTreeNode& node) {
@@ -461,7 +794,17 @@ private:
                 return compareValues(a, b) < 0;
             });
 
-        return pos - node.keys.begin();
+        size_t index = pos - node.keys.begin();
+        
+        // 確保索引不會超出children向量的範圍
+        // 對於內部節點，children的數量應該是keys數量+1
+        if (!node.is_leaf && index >= node.children.size()) {
+            std::cerr << "ERROR: Child index " << index << " out of range (children size: " 
+                      << node.children.size() << ", keys size: " << node.keys.size() << ")" << std::endl;
+            return node.children.size() > 0 ? node.children.size() - 1 : 0;
+        }
+        
+        return index;
     }
 
     int compareValues(const Value& a, const Value& b) {
@@ -514,6 +857,12 @@ public:
         if (total_records_ < 5 || total_records_ % 10000 == 0) {
             std::cout << "DEBUG: Appended record " << record_id << " to page " << page_id 
                       << " in file " << data_file_ << std::endl;
+            
+            // 每隔一段時間強制刷新頁面
+            if (total_records_ % 1000 == 0) {
+                buffer_manager_.flushPage(data_file_, page_id);
+                std::cout << "DEBUG: Forced flush of page " << page_id << std::endl;
+            }
         }
 
         total_records_++;
@@ -837,7 +1186,9 @@ public:
 
     ~LargeScaleDatabase() {
         // 確保所有資料都寫入磁碟
+        std::cout << "DEBUG: Database destructor - flushing all pages\n";
         buffer_manager_->flushAllPages();
+        std::cout << "DEBUG: All pages flushed\n";
     }
 
     void createTable(const std::string& table_name) {
@@ -921,9 +1272,58 @@ int main() {
     try {
         std::cout << "=== Large-Scale Columnar Database Demo ===\n";
         std::cout << "Features: Disk Storage, B+ Tree Indexing, Buffer Pool Management\n\n";
+        
+        // 測試檔案系統是否工作正常
+        std::cout << "0. Testing file system...\n";
+        std::string test_file = "./large_scale_db/test.txt";
+        std::filesystem::create_directories("./large_scale_db");
+        
+        std::ofstream test_stream(test_file);
+        if (test_stream.is_open()) {
+            test_stream << "Test data";
+            test_stream.close();
+            
+            auto file_size = std::filesystem::file_size(test_file);
+            std::cout << "File system test passed. Created test file with size: " << file_size << " bytes\n";
+            std::filesystem::remove(test_file);  // 清理測試檔案
+        } else {
+            std::cerr << "ERROR: File system test failed!\n";
+            return 1;
+        }
+        std::cout << "\n";
 
         // 建立支援大資料集的資料庫
         LargeScaleDatabase db("LargeScaleDB", "./large_scale_db");
+        
+        // B+ 樹序列化基本測試
+        std::cout << "0.1. Basic B+ Tree serialization test:\n";
+        
+        // 創建一個測試表格來測試 B+ 樹序列化
+        db.createTable("btree_test");
+        auto* test_table = db.getTable("btree_test");
+        test_table->addColumn("test_id", DataType::INT32);
+        
+        // 插入一些測試資料來觸發 B+ 樹序列化
+        std::cout << "Inserting test data to trigger B+ tree serialization...\n";
+        for (int i = 1; i <= 5; ++i) {
+            test_table->insertRow({ {"test_id", i} });
+            std::cout << "Inserted test record with id " << i << std::endl;
+        }
+        
+        // 強制刷新以確保資料寫入磁碟
+        db.optimize();
+        
+        // 測試搜尋來驗證 B+ 樹序列化
+        std::cout << "Testing B+ tree search after serialization...\n";
+        auto* test_column = test_table->getColumn("test_id");
+        if (test_column) {
+            auto search_results = test_column->findRecords(3);
+            std::cout << "Search for key 3 found " << search_results.size() << " records\n";
+            
+            auto range_results = test_column->findRecordsInRange(2, 4);
+            std::cout << "Range search [2, 4] found " << range_results.size() << " records\n";
+        }
+        std::cout << "B+ tree serialization test completed.\n\n";
 
         // 建立員工表格
         db.createTable("employees");
@@ -1035,6 +1435,58 @@ int main() {
         std::cout << "\n8. Flushing all data to disk...\n";
         db.optimize();  // 這會呼叫 flushAllPages
         std::cout << "Data flush completed.\n";
+        
+        // 額外確保所有資料都寫入
+        std::cout << "9. Final verification - forcing all pages to disk...\n";
+        for (const auto& table_name : {"employees", "large_dataset"}) {
+            auto* table = db.getTable(table_name);
+            if (table) {
+                for (const auto& col_name : table->getColumnNames()) {
+                    auto* column = table->getColumn(col_name);
+                    if (column) {
+                        // 透過存取最後一筆記錄來確保頁面載入和寫入
+                        if (column->size() > 0) {
+                            column->get(column->size() - 1);
+                        }
+                    }
+                }
+            }
+        }
+        db.optimize();  // 再次刷新
+        std::cout << "Final verification completed.\n";
+        
+        // 檢查實際檔案大小
+        std::cout << "\n10. File size verification:\n";
+        for (const auto& entry : std::filesystem::recursive_directory_iterator("./large_scale_db")) {
+            if (entry.is_regular_file()) {
+                auto file_size = std::filesystem::file_size(entry.path());
+                std::cout << "File: " << entry.path().string() << " - Size: " << file_size << " bytes\n";
+            }
+        }
+        
+        // B+ 樹序列化測試
+        std::cout << "\n11. B+ Tree serialization test:\n";
+        // 測試從磁碟重新載入索引
+        auto* id_column = emp_table->getColumn("id");
+        if (id_column) {
+            std::cout << "Testing B+ tree persistence for 'id' column...\n";
+            
+            // 嘗試查詢以觸發 B+ 樹載入
+            auto test_records = id_column->findRecords(1);
+            std::cout << "Found " << test_records.size() << " records with id=1 (testing B+ tree persistence)\n";
+            
+            // 測試範圍查詢
+            auto range_records = id_column->findRecordsInRange(1, 3);
+            std::cout << "Found " << range_records.size() << " records in range 1-3 (testing B+ tree range queries)\n";
+        }
+        
+        auto* salary_column = emp_table->getColumn("salary");
+        if (salary_column) {
+            std::cout << "Testing B+ tree persistence for 'salary' column...\n";
+            
+            auto salary_records = salary_column->findRecords(50000.0);
+            std::cout << "Found " << salary_records.size() << " records with salary=50000 (testing B+ tree with double type)\n";
+        }
 
         std::cout << "\n=== Large-Scale Columnar Database Features ===\n";
         std::cout << "✓ Disk Storage Support - Handle datasets larger than memory\n";
